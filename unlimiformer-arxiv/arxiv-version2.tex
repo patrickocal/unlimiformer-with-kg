@@ -1,0 +1,780 @@
+\documentclass{article}
+
+
+
+
+\usepackage[preprint]{neurips_2023}
+
+
+
+
+
+
+
+
+\usepackage[utf8]{inputenc} %
+\usepackage[T1]{fontenc}    %
+\usepackage{hyperref}       %
+\usepackage{url}            %
+\usepackage{booktabs}       %
+\usepackage{amsfonts}       %
+\usepackage{nicefrac}       %
+\usepackage{microtype}      %
+\usepackage{xcolor}         %
+
+\usepackage{times}
+\usepackage{latexsym}
+\usepackage{mathtools}
+\usepackage{amsmath}
+\usepackage{pgfplots} 
+\usepackage{booktabs}
+\usepackage{xspace}
+\usepackage{cleveref}
+\usepackage{verbatim} %
+\usepackage{amsmath,amsfonts,bm}
+\usepackage{arydshln}
+\usepackage{enumitem}
+\usepackage{wrapfig}
+\usepackage{selectp}
+
+\usepackage{todonotes} %
+\newcommand{\Note}[4][]{\todo[author=#2,color=#3,fancyline,size=\small,#1]{#4}}
+\newcommand{\noteMatt}[2][]{\Note[#1]{Matt}{blue!20}{#2}}
+\newcommand{\NoteMatt}[2][]{\noteMatt[inline,#1]{#2}}
+\newcommand{\noteUri}[2][]{\Note[#1]{Uri}{purple!20}{#2}}
+\newcommand{\amanda}[1]{{\color{teal}Amanda:[#1]}}
+
+\newcommand{\uri}[1]{{\color{purple}Uri:[#1]}}
+\newcommand{\noteAmanda}[2][]{\Note[#1]{Amanda}{red!20}{#2}}
+\newcommand{\NoteAmanda}[2][]{\noteAmanda[inline,#1]{#2}}
+\newcommand{\gn}[2][]{\Note[#1]{Graham}{green!20}{#2}}
+\newcommand{\NoteGraham}[2][]{\noteGraham[inline,#1]{#2}}
+\newcommand{\TODO}[1]{\textcolor{red}{#1}}
+
+\newcommand{\ours}{Unlimiformer\xspace}
+\def\vh{{\bm{h}}}
+
+\urlstyle{same}
+
+\title{Unlimiformer: Long-Range Transformers with Unlimited Length Input}
+
+\author{Amanda Bertsch \and Uri Alon \and Graham Neubig \and Matthew R. Gormley
+ \\
+        Carnegie Mellon University, USA \\
+        \texttt{\{abertsch,ualon,gneubig,mgormley\}@cs.cmu.edu}}
+
+
+\begin{document}
+\maketitle
+\begin{abstract}
+Since the proposal of transformers \citep{vaswani-attn}, these models have been limited to bounded input lengths, because of their need to attend to every token in the input.
+In this work, we propose \ours{}: a general approach that wraps any existing pretrained encoder-decoder transformer, and offloads the cross-attention computation 
+to a single $k$-nearest-neighbor ($k$NN) index, while the returned $k$NN distances are the attention dot-product scores.
+This $k$NN index can be kept on either the GPU or CPU memory and queried in sub-linear time;
+this way, we can index practically unlimited input sequences, while every attention head in every decoder layer retrieves its top-$k$ keys, instead of attending to every key. 
+We 
+evaluate \ours
+on several long-document and book-summarization benchmarks, showing that it can %
+process even 500k token-long inputs from the BookSum dataset, without any input truncation at test time. We demonstrate that \ours improves pretrained models such as BART \citep{lewis2020bart} and Longformer \citep{beltagy2020longformer} by extending them to unlimited inputs without additional learned weights and without modifying their code. 
+We make our code and models publicly available\footnote{\url{https://github.com/abertsch72/unlimiformer}}.
+
+\end{abstract}
+
+\section{Introduction}
+
+
+
+
+
+
+Transformers \citep{vaswani-attn} have risen as the dominant sequence-to-sequence architecture. %
+Pretrained transformers 
+generally have a context window of 512 (e.g. BERT \citep{devlin-etal-2019-bert}, T5 \citep{raffel2020exploring}) or 1024 tokens (e.g. BART \citep{lewis-etal-2020-bart}), 
+which are sufficient lengths for many current conditional generation datasets \citep[XSum; ][]{narayan-etal-2018-dont} \citep[CNN/DM; ][]{nallapati-etal-2016-abstractive}. 
+To address inputs between 1024 and 16,384 tokens, specialized long-context models sparsify or approximate attention (e.g. Longformer \citep{beltagy2020longformer}, Performers \citep{performers}), allowing the maximum input length to quadruple while remaining computationally feasible. 
+Most long-document summarization and question-answering datasets, such as 
+SCROLLS \citep{scrolls}, are included in this range.
+
+
+
+Yet tasks that involve long narratives, such as book summarization \citep{booksum},
+can contain inputs \emph{exceeding 500k tokens}. %
+Figure \ref{fig:dataset-size} shows the input lengths of several popular summarization and question-answering datasets, plotted against common context window lengths; the longest inputs are more than 34 times longer than Longformer's context window.
+
+In these extremely-long-input cases, vanilla transformers cannot be simply scaled, as na\"ive self-attention has quadratic complexity. 
+Long-input transformers 
+usually \emph{modify the base architecture}, 
+and thus
+necessitate re-pre-training the model from scratch, which 
+requires significant computational resources.
+Other architectures such as Longformer-Encoder-Decoder \citep[LED; ][]{beltagy2020longformer} \emph{can} leverage pretrained models, but they still need to further train new position embeddings or global attention weights,
+which is computationally and environmentally costly. 
+
+
+\begin{wrapfigure}{r}{0.5\textwidth}
+    \centering \resizebox{\linewidth}{!}{
+\includegraphics[width=\linewidth]{figures/long-datasets.pdf}
+}
+    \caption{Long-range transformers can avoid input truncation in some datasets; however, there are datasets with inputs many times longer than these models' maximum input length. The dotted lines represent three common maximum input lengths for models; the bars are the average or maximum input length in each dataset, as indicated. Averages for datasets from \citet{empirical-longdoc-summary}.
+    }
+    \label{fig:dataset-size}
+\vspace{-2mm}
+\end{wrapfigure}
+
+We introduce \ours{}, a retrieval-based approach to augment pretrained language models to accept inputs of unbounded length at test time. 
+Given a long input sequence,
+\ours constructs a $k$-nearest-neighbor ($k$NN) index over the hidden states of all input tokens. 
+Then, every  standard cross-attention head in every decoder layer queries the $k$NN index, 
+such that the $k$NN distances are the attention dot-product scores, 
+and attends only to the top-$k$ input tokens.
+In preliminary experiments, we found that 
+the top-$k$ attention keys cover more than 99\% of the attention mass, and thus attending only to the top-$k$ keys is an accurate approximation of the full, exact, attention. 
+\ours can be injected into any existing encoder-decoder transformer to permit unbounded inputs.
+The index can be stored in either GPU or CPU memory,
+needs to hold only \emph{a single vector per input token}, 
+and can be queried in  sublinear time. 
+\ours is illustrated in \Cref{fig:model-diagram}.
+
+\ours is a \emph{generic} approach: it can be applied to trained models and improve existing checkpoints without adding weights and without further training.
+When \emph{finetuning} \ours, performance is even further improved: %
+across a variety of long-range datasets,
+not only that \ours performs better 
+than strong long-range transformers such as LED \citep{beltagy2020longformer}, PRIMERA \citep{xiao-etal-2022-primera}, SLED \citep{sled} and Memorizing Transformers \citep{memtrans}, but  \ours can be applied \emph{on top of} such models to further improve them. 
+
+
+
+
+\begin{figure*}[t]
+\centering
+    \includegraphics[]{figures/unlimformer_diagram3.pdf}
+    \caption{In this example, a given LM's encoder's maximum input length is 2 tokens. A 6-token input is encoded in chunks and indexed in an index. We inject \ours into each decoder layer prior to cross-attention. In \ours, we perform $k$NN search to select a 2-token context for each attention head from the index. This makes cross-attention attend to tokens
+    from the entire input sequence, without adding parameters and without changing the given LM's architecture.}
+    \label{fig:model-diagram}
+\end{figure*}
+
+\section{\ours }
+Given a trained encoder-decoder  transformer,
+\ours allows each cross-attention head to choose separate keys to attend to from the full-length input, at each decoding step. 
+We inject a $k$NN search into each decoder layer: prior to cross-attention, the model performs a nearest-neighbor search in a $k$NN index to choose a set of per-decoder-layer per-attention-head tokens to attend to.
+
+
+
+\subsection{Encoding} To encode an input sequence that is longer than the model's context window, we use the given model's encoder to encode overlapping chunks of the input,
+following \citet{sled}. We keep only the middle half of the encoded vectors from each chunk, to ensure that the encodings have sufficient context on both sides. Finally, we index the encoded inputs in a $k$NN index, using a library such as Faiss \citep{faiss}, using dot-product as the index's nearest-neighbor similarity metric.
+
+
+
+\subsection{Retrieval-augmented Cross-Attention}
+In standard cross-attention, a transformer decoder attends to the encoder's top-layer hidden states,
+where the encoder usually truncates the input and encodes only the $k$ first tokens in the input sequence.
+
+Instead of attending  only to this $k$-token prefix of the input, we retrieve the top-$k$ hidden states from the $k$NN index for each cross-attention head, and attend \emph{only to these top-$k$}.
+This allows retrieval from the \emph{entire} input sequence instead of truncating.
+Our approach is also cheaper, in computation and GPU-memory, than attending to all input tokens; and because softmax is dominated by the largest values, retrieving the most-attended tokens preserves the vast majority of attention mass. %
+
+
+Figure \ref{fig:model-diagram} illustrates our generic changes to any sequence-to-sequence transformer's architecture. 
+The full input is encoded using the encoder in chunks and indexed in a $k$NN index; 
+then, the index of encoded hidden states is queried at each decoding step.
+The $k$NN search step is non-parametric and can be injected into any pretrained seq2seq transformer. The search step reformulates attention for space efficiency, as detailed below. 
+
+\subsection{Attention reformulation}
+\label{subsec:attentiontrick}
+
+Let $\vh_d$ be the decoder hidden state and $\vh_e$ be an encoder's last layer hidden state. 
+The standard cross-attention computation for a single head in a transformer is:
+\begin{equation}
+   \mathrm{Attn}(Q, K, V) = \mathrm{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V
+\end{equation}
+where $Q={\vh_d}W_q$ is the product of the decoder states $\vh_d$ and the query weight matrix $W_q$; 
+the keys $K = {\vh_e}W_k$ are the product of the last encoder hidden states $\vh_e$ with the key weight matrix $W_k$; 
+and $V={\vh_e}W_v$ is similarly the product of $\vh_e$ with the value weight matrix $W_v$. 
+Our goal is to retrieve a set of keys $K_{best}$ that maximize $QK_{best}^T$, with the size of $K_{best}$ fixed to the size of the model's context window, and then compute the standard attention over $K_{best}$ only.
+
+Note that the linear layers $W_q$, $W_k$, and $W_v$ are layer-specific and head-specific. Thus, na\"ively creating an index from the keys $K = {\vh_e}W_k$ and querying this index using the query vectors will require 
+constructing separate indexes for the keys and values at each layer and each head, for a total of $2\times L \times H$ indexes, where $L$ is the number of decoder layers and $H$ is the number of attention heads.
+In fact, this exact na\"ive approach was taken by Memorizing Transformers \citep{memtrans}, who pioneered the use of a $k$NN index for previously encoded inputs.\footnote{See Memorizing Transformers' official implementation at \url{https://github.com/google-research/meliad/blob/main/transformer/memory\_factory.py\#L78-L79} and \url{https://github.com/google-research/meliad/blob/main/transformer/memory\_layer.py\#L334-L339}} 
+A separate index for each attention head in each decoder layer is both time-intensive to create and space-intensive to store. 
+So, not surprisingly, \citet{memtrans} apply their memory layer to only a \emph{single} decoder layer.
+
+ Instead, we present a different order of computing the well-known transformer attention formula, which allows us to store a \emph{single} index across \emph{all} attention heads and all decoder layers, \emph{without changing} the mathematical definition of the transformer's standard dot-product attention.
+The dot-product part of the  transformer's attention computation can be rewritten as follows:\footnote{For brevity, we omit the linear layers' bias term, as softmax is invariant to constants added to all inputs.}
+\begin{align}
+    QK^T = &\left({\vh_d}W_q\right)\left({\vh_e}W_k\right)^{\top} \\
+         = &\left({\vh_d}W_q\right)W_k^{\top}{\vh_e}^{\top} \nonumber \\
+        = &\left({\vh_d}W_qW_k^{\top}\right){\vh_e}^{\top} \nonumber 
+\end{align}
+Thus, the retrieval step can be formulated as choosing the encoder hidden states $\vh_e$ that maximize $\left({\vh_d}W_qW_k^{\top}\right){\vh_e}^{\top}$. This rewriting has two major advantages: first, 
+\emph{there is no need to index the keys for each head and layer separately}: we can create a \emph{single} index of the hidden states $\vh_e$ only, and just project the queries to ${\vh_d}W_qW_k^{\top}$ using head-specific and layer-specific $W_q$ and $W_k$; 
+second, the \emph{values} can be calculated trivially given $\vh_e$, so there is no need to store the values in a separate index from the keys 
+before decoding.
+Thus, instead of constructing $2\times L \times H$ indexes and retrieving from all indexes during each decoding step, we construct a \emph{single} index from $\vh_e$ and retrieve from it by just projecting the decoder hidden states to per-head per-layer ${\vh_d}W_qW_k^{\top}$. %
+
+Using our reformulation, the index stores only a \emph{single} vector per input token. Using 16-bit floats and hidden states of size 1024, this requires only 2GB of memory for 1,000,000 input tokens.
+Since indexes can be offloaded to the CPU memory, \ours's input length is practically unlimited.
+
+
+
+
+\section{Training \ours}
+\ours
+can be used, at test time, with an already-trained model, and lead to gains without further training, as we show later in \Cref{tab:small-datasets-low}. 
+Next, we turn our focus to training approaches to further improve the performance of \ours. 
+Table \ref{tab:methodology-comp} summarizes and contrasts the training approaches described below, and Appendix \ref{appendix:implementation-details} contains further implementation details.
+
+
+\begin{table*}[h]
+\resizebox{\linewidth}{!}{
+\begin{tabular}{lllll}
+\toprule
+Method name                           & Training input & \begin{tabular}[c]{@{}l@{}}total \# tokens in \\ example seen at \\ training time\end{tabular} & \begin{tabular}[c]{@{}l@{}}Validation input\\ (early stopping)\end{tabular} & Test input \\ 
+\midrule
+Baseline                              & 1024                & 1024                                                                                           & 1024                                                                                  & 1024            \\
+\qquad+test \ours                              & 1024                & 1024                                                                                           & 1024                                                                                  & unlimited       \\
+\qquad+early stop w/ \ours           & 1024                & 1024                                                                                           & unlimited                                                                             & unlimited       \\
+Train chunked +test \ours & 1024                & all                                                                                            & unlimited                                                                             & unlimited       \\ 
+\hdashline
+SLED \citep{sled} & 16k & 16k & 16k& 16k \\
+Longformer \citep{beltagy2020longformer} &16k  & 16k & 16k & 16k \\
+Random-encoded training                     & 8-16k               & 8-16k                                                                                          & unlimited                                                                             & unlimited       \\
+Retrieval training                          & 8-16k               & 8-16k                                                                                          & unlimited                                                                             & unlimited       \\
+Alternating training               & 8-16k               & 8-16k                                                                                          & unlimited                                                                             & unlimited    \\  
+\bottomrule
+\end{tabular} }
+\caption{A comparison of the training approaches using BART (context window size 1024) as a running example. The dashed line separates methods that are approximately the same training-time cost as the baseline, from those that require significant additional compute.}
+\label{tab:methodology-comp}
+\end{table*}
+
+\subsection{Low (additional-) Cost Training Methods}
+We first consider training approaches that do not require significant additional compute as compared to the standard finetuning regime.
+\begin{description}[noitemsep]
+
+\item[\textit{+test \ours:}] As the simplest case, we use a standard fine-tuning regime, where the input is truncated during training. At inference time only, we inject \ours into the trained model to process full-length inputs.
+
+\item[\textit{+early stop w/ \ours:}] We train without \ours, but when we evaluate the model for early stopping, we use \ours for generation on the validation set. This results in choosing a slightly different checkpoint to stop training at; the additional computational cost here is minor, and comes only from the application of \ours 
+over the validation set. 
+
+\item[\textit{Train chunked +test \ours:}] 
+As a data augmentation approach, we split each training example into chunks of the context-window size, and treat each chunk as its own training example. 
+This is orthogonal to the \ours{} model, but has the advantage that 
+all tokens from the full-length training example are observed during training
+instead of truncated---albeit across several  examples. We apply early stopping with \ours on the validation set.
+
+\end{description}
+
+
+
+\subsection{Long-range Training Methods}
+We also consider training \ours directly, which introduces  additional computational cost.  %
+
+\begin{description}[noitemsep]
+    \item[\textit{Random-encoded training:}] At each training step, the full (longer-than-context-window) training example is encoded in chunks; then, the keys for each decoder layer are chosen randomly from the encoded hidden states. This weakly simulates a nearest-neighbors search, but is  computationally cheaper.
+    \item[\textit{Retrieval training:}] At each training step, the keys for each decoder head and layer are selected using a $k$NN search. 
+    When inputs are longer than 16k tokens, we truncated the input to 16k tokens at training time due to GPU memory requirements.
+    This training approach is the closest to the test-time computation.
+    \item[\textit{Alternating training:}] In this approach we alternate batches of \textit{Random-encoded training} and \textit{Retrieval training}. \emph{Retrieval training} is identical to the test-time setting, while \emph{Random-encoded} introduces regularization that makes the model attend to non-top-$k$ keys as well.
+\end{description}
+
+
+
+\section{Experimental Settings}
+
+
+\subsection{Datasets}
+
+\begin{table*}[h]
+\centering
+\begin{tabular}{l|lrrrrlr}
+\toprule
+                                                 & &   \multicolumn{2}{c}{ Avg \# tokens} &\\
+Dataset    & Domain & \# examples & Input & Output & \multicolumn{3}{c}{Input length distribution} \\ 
+\midrule
+GovReport  & Government       &    19,402            &   9,616     & 597                       &           \tiny{74} & \includegraphics[height=\fontcharht\font`\B,width=2cm]{figures/govreport-histogram.png} & \tiny{303192}                   \\
+SummScreen & TV shows       &     4,348           &            8,987                  &       137   & \tiny{2365} & \includegraphics[height=\fontcharht\font`\B,width=2cm]{figures/summscreen-histogram.png} & \tiny{22635}                      \\
+BookSum    &  Literature      &  436  & 143,301	      &  1294          & \tiny{8388} & \includegraphics[height=\fontcharht\font`\B,width=2cm]{figures/booksum-histogram.pdf} & \tiny{642376} \\  
+\bottomrule         
+\end{tabular}
+\caption{Dataset statistics. The last column is a visualization of the distribution of input example lengths in each dataset; the histogram is binned by powers of 2, with the minimum and maximum input size displayed on either end.}
+\label{tab:dataset-stats}
+\end{table*}
+We experiment with two long-document- and one book-summarization datasets from varying domains. Table \ref{tab:dataset-stats} summarizes statistics for each dataset. GovReport and SummScreen were taken from the SCROLLS benchmark \citep{scrolls}. 
+\textbf{GovReport} \citep{huang-etal-2021-efficient} is a long-document summarization dataset where the task is to write the executive summary of a US government report.  
+\textbf{SummScreen} \citep{chen-etal-2022-summscreen} is a long-document summarization dataset where the task is to write the recap of a TV show episode (such as ``Friends''), given the transcript of the entire episode. 
+\textbf{BookSum} \citep{booksum} is a book-summarization dataset of 
+entire books. BookSum has paragraph, chapter, and book-level settings; we consider the hardest \textsc{BookSum}-Book setting, where the task is to generate a book-level summary given the full text of the novel as input. 
+
+\paragraph{Metrics}
+We report ROUGE 1/2/L \citep{lin-2004-rouge} and BERTScore F1 \citep{bertscore}. Following 
+\citet{zhang-etal-2021-leveraging-pretrained}, 
+in BookSum we also used Entity Mention Recall (``EntMent'') as a proxy for the informativeness of the candidate summaries. EntMent measured the fraction of gold entities mentioned in the candidate summary.
+Additional evaluation details are provided in \Cref{appendix:evaldetails}.
+
+\subsection{Baselines}
+\textbf{BART} (base) \citep{lewis-etal-2020-bart} is a pretrained seq2seq model (139M parameters), commonly used for summarization tasks. Its maximum input sequence length is 1024 tokens.
+
+\textbf{PRIMERA} \citep{xiao-etal-2022-primera} is a Longformer-Encoder-Decoder \cite[LED$_{\texttt{large}}$; ][]{beltagy2020longformer}  (447M parameters), pretrained specifically for multi-document summarization, with maximum input length of 4096 tokens. 
+
+\textbf{SLED} \citep{sled} extends encoder-decoder models for longer contexts by applying fusion in-decoder \citep{izacard-grave-2021-leveraging}: the long input is encoded in chunks, and the decoder then attends to \emph{all} input tokens.
+This allows the use of pretrained models, albeit with expensive fine-tuning. The input sequence length is eventually memory bounded. 
+
+\textbf{Memorizing Transformers} \citep{memtrans} is the most similar work to ours; they propose extending a transformer with a trainable attention gate that moderates between the standard cross-attention and attention over retrieved keys from a datastore. %
+Since their public implementation\footnote{\url{https://github.com/google-research/meliad}} 
+is ``not officially supported'' and is not fully reproducible,
+we approximated it by using attention over the index in only a \emph{single} decoder layer; this is equivalent to their setting with the learned interpolation parameter \textit{g} set to 1.\footnote{\citet{memtrans} note that in their experiments that most heads learned a value for \textit{g} such that they attended ``almost exclusively'' to the external memory.} Our work differs from Memorizing Transformers in several key ways: \citet{memtrans} added additional weights, and thus cannot easily leverage pretrained LMs, while Unlimiformer is fully non-parametric and can improve performance without fine-tuning; further, \citet{memtrans} applies retrieval attention  to only a \emph{single} layer because of computational constraints, while our attention reformulation enables the use of \ours in \emph{every} decoder layer with individualized retrieval per-head, while still being more efficient than Memorizing Transformers, as we detail in \Cref{subsec:attentiontrick}. 
+
+
+
+
+
+
+
+\section{Results}
+\label{sec:results}
+\subsection{Long Document Summarization}
+\begin{table*}[t!]
+\centering
+ \resizebox{\linewidth}{!}{
+\begin{tabular}{llll}
+\toprule
+Base model & Training method             & \multicolumn{2}{c}{ROUGE 1 / 2 / L / BERTScore} \\ %
+& &\multicolumn{1}{c}{GovReport} & \multicolumn{1}{c}{SummScreen} \\
+\midrule
+\textsc{bart}$_{\texttt{base}}$       & Standard finetuning          & 48.7 / 19.2 / \textbf{22.8} / 64.3 & 29.7 / 6.2 / 17.7 / 56.3 \\
+\textsc{bart}$_{\texttt{base}}$       & \qquad+test SLED  \citep{sled}               & 45.8 / 16.1 / 20.2 / 62.7  & 27.5 / 5.5 / 16.7 / 55.9  \\
+\textsc{bart}$_{\texttt{base}}$       & \qquad+test \ours                 &   49.7 / 19.6 / 22.0 / 64.8       &  30.9 / 6.5 / 18.2 / 57.5  \\
+\textsc{bart}$_{\texttt{base}}$       & \qquad+early stop w/  \ours &  \textbf{51.0} / \textbf{20.5} / 21.5 / \textbf{65.1}  & \textbf{32.1}  / \textbf{6.8} / \textbf{18.6} / \textbf{57.6}  \\
+\midrule
+\textsc{bart}$_{\texttt{base}}$    & Train chunked     & 46.2 / 17.8 / 21.7 / 63.3 & 28.1 / 5.6  / 17.0 / 55.6 \\
+\textsc{bart}$_{\texttt{base}}$       & \qquad+test \ours      &  \textbf{53.4} / \textbf{22.5} / \textbf{22.5} / \textbf{66.0} & \textbf{29.3} / \textbf{6.6} / \textbf{17.6} / \textbf{57.0} \\
+\midrule
+\textsc{PRIMERA}    & Standard finetuning    &  55.1 / 23.9 / 25.9 / 67.0 & 32.3 / 7.1 / 18.3 / 57.1 \\
+\textsc{PRIMERA}       & \qquad+test \ours                 &  \textbf{56.5} / \textbf{24.8} / \textbf{26.3} / \textbf{67.7} & \textbf{33.3} / \textbf{7.7} / \textbf{19.1} / \textbf{57.6} \\
+\bottomrule
+\end{tabular} 
+}
+\caption{Results on long-document summarization, low-cost training methods:
+the training costs are no higher than standard finetuning that truncates the inputs to the model's max input size.
+The best metric in every training category is marked in \textbf{bold}. 
+PRIMERA \citep{xiao-etal-2022-primera} is a Longformer-Encoder-Decoder \citep{beltagy2020longformer} with additional summarization-specific pretraining.
+} 
+\label{tab:small-datasets-low}
+\end{table*}
+
+\begin{table*}[t!]
+\centering
+\begin{tabular}{llll}
+\toprule
+Base model & Training method             & \multicolumn{2}{c}{ROUGE 1 / 2 / L / BERTScore} \\ %
+& &\multicolumn{1}{c}{GovReport} & \multicolumn{1}{c}{SummScreen} \\
+\midrule
+\textsc{bart}$_{\texttt{base}}$       & SLED  \citep{sled} & 54.7 / 24.4 / 25.4 / 67.0 & 32.7 / 7.9 / 19.1 / 58.4 \\
+ LED$_{\texttt{large}}$    & \textsc{PRIMERA} \citep{xiao-etal-2022-primera}    &  55.1 / 23.9 / 25.9 / 67.0 & 32.3 / 7.1 / 18.3 / 57.1 \\
+\textsc{bart}$_{\texttt{base}}$       & Memorizing transformers   & 55.2 / 25.1 / 26.4 / 67.5  & 32.7 / 7.4 / 19.2 / 57.4\\
+ \textsc{bart}$_{\texttt{base}}$       & \ours (this work) &  \textbf{56.6} / \textbf{26.3} / \textbf{27.6} / \textbf{68.2} &  \textbf{34.7} /  \textbf{8.5} /  \textbf{19.9} / \textbf{58.5}\\ 
+ \midrule
+\textsc{PRIMERA}    & Memorizing transformers    &  57.0 / 25.3 / 26.5 / 67.7 & 33.0 / 7.3 / 18.4 / 57.3 \\
+\textsc{PRIMERA}    & \ours (this work) & \textbf{57.4} / \textbf{26.2} / \textbf{28.0} / \textbf{68.1} & \textbf{33.3} / \textbf{7.6} / \textbf{18.9} / \textbf{57.7}  \\
+\bottomrule
+\end{tabular} 
+
+\caption{Test results on long-document datasets, when allowing compute-costly, long-range training methods, using different base models.
+The best metric in every dataset and every training category is marked in \textbf{bold}. 
+} 
+\label{tab:small-datasets-high}
+\end{table*}
+
+\begin{table*}[h!]
+\centering
+\begin{tabular}{llll}
+\toprule
+Base model & Training method       &      ROUGE 1 / 2 / L & EntMent \\ 
+\midrule
+\textsc{bart}$_{\texttt{base}}$       & Hierarchical \citep{booksum} &  30.0 / 6.0 / 11.0 & -
+\\
+
+\textsc{bart}$_{\texttt{base}}$       & Standard finetuning  &  36.4 / 7.6 / 15.3 & 10.0 \\
+\textsc{bart}$_{\texttt{base}}$       & \qquad+test \ours   & 35.5 / \textbf{7.7} / 15.4 & \textbf{21.9} \\
+\textsc{bart}$_{\texttt{base}}$       & \qquad+early stop w/  \ours   & 35.5 / \textbf{7.7} / 15.4 & \textbf{21.9} \\
+\textsc{bart}$_{\texttt{base}}$       & Memorizing Transformers                       &    35.6 / 6.4 / 14.6 & 10.1 \\
+
+\textsc{bart}$_{\texttt{base}}$       & Unlimiformer (random-encoded training)                        &    \textbf{37.3} / 6.7 / 15.2 & 20.8 \\
+\textsc{bart}$_{\texttt{base}}$       & Unlimiformer (alternating training)                          &           36.7 / 7.3 / \textbf{15.5} & 20.3                                       \\ 
+\midrule
+\textsc{PRIMERA}    & Standard finetuning          &   38.6 / 7.2 / 15.6 & 11.6    %
+                                                                         \\
+\textsc{PRIMERA}    & \qquad+test \ours{}                   &      38.3 / 7.5 / 15.9 & 18.9 %
+\\
+\textsc{PRIMERA}    & \qquad+early stop w/  \ours &    \textbf{39.5} / 7.3 / 15.8 & 22.2                                           \\
+\textsc{PRIMERA}    & \ours{} (retrieval training)              &              37.9 / \textbf{8.2 / 16.3} & \textbf{25.5}                                  \\
+\textsc{PRIMERA}    & \ours{} (random-encoded training)                       &     \textbf{39.5} / 7.1 / 15.9 & 19.7                                           \\
+\bottomrule
+\end{tabular}                                   
+\caption{Results on BookSum (average input length $\approx$ \textbf{143k} tokens). \textit{EntMent} is entity recall.
+Hierarchical summarization is a baseline reported by \citet{booksum}, where chapter summaries are condensed to form a book summary.
+The best metric in every dataset is marked in \textbf{bold}.
+}
+\label{tab:large-datasets}
+\end{table*}
+
+
+\paragraph{Low-cost training}
+\Cref{tab:small-datasets-low} shows the results in the long-document %
+summarization datasets. First, we can see that applying \ours on an existing checkpoint without any training (\textit{+test \ours}) improves BART$_{\text{base}}$ by, for example, 1.8 ROUGE-1 points on both datasets, and improves PRIMERA by 1-1.4 ROUGE-1 points.
+In contrast, without additional training, SLED decreases performance.
+Thus, \ours is the only model that can provide benefits without further training. 
+
+\textit{Early stop w/ \ours} further improves the base model without any special training: it provides, for example, 3.3 ROUGE-1 points gain on GovReport, while the training computational cost is identical to standard finetuning. 
+\emph{Train chunked} does not provide benefits on its own; however injecting \ours applied at test time results in the most significant gains: 7.2 ROUGE-1 and 3 BERTScore points improvements, while training is as computationally cheap as standard finetuning.
+
+\paragraph{Long-range training}
+\Cref{tab:small-datasets-high} shows results when allowing computationally expensive training approaches.
+As shown, in almost all metrics and datasets, \ours outperforms the SLED and Memorizing Transformers baselines when using  the same base model. 
+
+The PRIMERA experiments in \Cref{tab:small-datasets-high} highlight two important points: first, Unlimiformer+BART$_{\text{base}}$ performs better than the base PRIMERA across all metrics and datasets, even though PRIMERA is larger and was pretrained on much more data, using a pretraining objective that was designed for summarization; 
+second, 
+not only can \ours outperform Longformer-based models such as PRIMERA, \ours can also be applied \emph{on top} of existing long-range transformers and further improve them: Unlimiformer+PRIMERA improves over PRIMERA across all metrics and datasets.
+Additional results on the validation set are provided in \Cref{appendix:validation}.
+
+\subsection{Book Summarization}
+\Cref{tab:large-datasets} shows the result on BookSum. As shown, \ours improves both base models BART$_{\text{base}}$ and PRIMERA, in both low-cost training approaches such as \textit{Early stop w/ \ours}, as well as in the long-range training approaches.
+ \textit{Random-encoded-},  \textit{Retrieval-}, and \textit{Alternating-} training show competitive performance, with the best method varying across datasets and models.
+
+We found that although \ours outperforms all base models on BookSum (\Cref{tab:large-datasets}), the base BART (\emph{Standard finetuning}, which truncates the input to the first 1024 tokens) shows competitive ROUGE and BERTScore metrics.
+This is strongly counterintuitive for book summarization, where the book's plot should not be apparent from reading only the first pages.
+In the outputs from this base model, we observe limited coherence and a high rate of hallucination (see \Cref{sec:sample_output} for an example with analysis). However, this is not reflected in n-gram-based overlaps, and BERTScore does not strongly distinguish between any of the BookSum models.
+
+Nonetheless, the ability to attend to unlimited inputs at test time allows \ours to achieve significantly better Entity Mention Recall (EntMent): 
+the \ours models exhibit far higher EntMent, and even adding \ours only at test time without costly training ({\textit{Early stop w/ \ours}}) \emph{doubles} the entity recall compared to the base model. Further, \ours improves EntMent in the base PRIMERA from 11.6 to 25.5 in Unlimiformer+PRIMERA.
+
+
+
+
+
+
+
+
+\begin{figure*}
+\begin{minipage}[t][][b]{0.48\textwidth}
+    \centering
+    \begin{tikzpicture}[scale=1]
+      \begin{axis}[
+        ylabel={Entity Mention Recall},
+        xlabel={Max input size (in thousands of tokens)},
+        xlabel style={font=\footnotesize},
+        tick label style={font=\footnotesize},
+        ylabel style={font=\footnotesize},
+        ylabel near ticks,
+        legend style={at={(0.05,0.05)},anchor=south west,mark size=3pt, %
+        inner xsep=1pt, inner sep=0pt},
+            legend cell align={left},
+        legend cell align={left},
+        ymin=0, ymax=25,
+        symbolic x coords={1, 2, 4, 8, 16, 32, 64, 100, 350},
+        xtick=data,
+        ytick={0,5,10,15,20,25,30},
+          grid = major,
+          major grid style={dotted,gray},
+          height=5.5cm,
+          width=1.05\textwidth,
+          enlarge x limits=0.05,
+          ]
+
+          \addplot[color=blue, solid, mark options={solid, fill=blue, draw=black}, mark=*, line width=1pt, mark size=2pt, visualization depends on=\thisrow{alignment} \as \alignment, nodes near coords, point meta=explicit symbolic,
+          every node near coord/.style={anchor=\alignment, font=\footnotesize}] 
+          table [meta index=2]  {
+            x   y       label   alignment
+            1  11.9  {}  0
+            2  14.4  {}  0
+            4  15.3  {}  0
+            8  16.6  {}  0
+            16 20.1  {}  0
+            32 21.4  {}  0
+            64 18.5  {}  0
+            100    17.6  {}  0
+            350    20.2  {}  0
+            }; 
+            \addlegendentry{\ours}
+            
+            \addplot[red, dashed,update limits=false,line width=1pt] coordinates { ([normalized]-1,9.96) ([normalized]10,9.96) };
+             \addlegendentry{BART$_\mathrm{base}$}
+          \end{axis}
+  \end{tikzpicture}
+    \caption{As the maximum datastore size increases, the entity recall generally increases. At all datastore sizes, Unlimiformer outperforms the baseline (BART, in red). }
+    \label{fig:input-truncation}
+\end{minipage}
+\hfill
+\begin{minipage}[t][][b]{0.48\textwidth}
+    \centering
+    \begin{tikzpicture}[scale=1]
+      \begin{axis}[
+        ylabel={Relative time per example},
+        xlabel={Max input size (in thousands of tokens)},
+        xlabel style={font=\footnotesize},
+        tick label style={font=\footnotesize},
+        ylabel style={font=\footnotesize},
+        ylabel near ticks,
+        legend style={at={(0,1)},anchor=north west,mark size=3pt, %
+        inner xsep=1pt, inner sep=0pt},
+            legend cell align={left},
+        legend cell align={left},
+        ymin=0, ymax=7,
+        xmin=0, xmax=100,
+        xtick={0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100},
+        ytick={0,1,2,3,4,5,6,7},
+          grid = major,
+          major grid style={dotted,gray},
+          height=5.5cm,
+          width=1.05\textwidth,
+          enlarge x limits=0.05,
+          ]
+
+          \addplot[color=blue, solid, mark options={solid, fill=blue, draw=black}, mark=*, line width=1pt, mark size=2pt, visualization depends on=\thisrow{alignment} \as \alignment, nodes near coords, point meta=explicit symbolic,
+          every node near coord/.style={anchor=\alignment, font=\footnotesize}] 
+          table [meta index=2]  {
+            x   y       label   alignment
+            1.024  2.28  {}  0
+            2.048  2.40  {}  0
+            4.096  2.51  {}  0
+            8.192  2.70  {}  0
+            16.384 2.72  {}  0
+            32.768 3.08  {}  0
+            65.536 3.26  {}  0
+            100.000    3.55  {}  0
+            }; 
+            \addlegendentry{\ours}
+            
+            \addplot[red, dashed,update limits=false,line width=1pt] coordinates {(-10,1) (120.000,1) };
+             \addlegendentry{BART$_\mathrm{base}$ (truncates to 1024)}
+          \end{axis}
+  \end{tikzpicture}
+    \caption{As the maximum datastore size increases, the inference cost increases sublinearly.}
+    \label{fig:computational-scaling}
+\end{minipage}
+\end{figure*}
+
+
+
+
+
+
+
+
+
+\section{Analysis}
+\label{sec:input-limitation}
+\paragraph{Is the long input really needed?}
+As found in various recent papers \citep{scrolls,kedzie-etal-2018-content}, many text generation datasets do not require long-range modeling, since most of the needed information is concentrated at the beginning of the input.
+To evaluate whether \ours really utilizes long inputs, 
+we experimented with limiting the input length in BookSum.
+\Cref{fig:input-truncation} shows the performance of \ours in BookSum: EntMent increases almost monotonically with input length, suggesting \ours exploits the longer inputs to generate better outputs.
+
+Other work \citep{jiang-bansal-2019-avoiding} has found that in some datasets, the needed information is concentrated
+in only part of the input, which is not necessarily the beginning.
+We observed this trend in WikiSum, a multi-document summarization dataset where the inputs are all references of a Wikipedia article and the output summary is the intro paragraph of the article \citep{wikisum}\footnote{A full copy of WikiSum is not available online; details of our scraped copy are in \Cref{subsec:wikisum-scrape}.}. 
+As a strong baseline, we followed \citet{wikisum}, and ranked the input paragraphs according to TF-IDF. 
+\ours did not improve over a baseline that uses only the first 1024 tokens of this sorted input, suggesting that the full input is not necessary to produce the summary on this dataset. 
+
+\textbf{Computational cost} \quad Although \ours does not introduce additional trained parameters, the encoding of the full input, index construction, and index search increase the processing time during both training and inference.
+We plot the computational cost of inference with respect to the input length in Figure \ref{fig:computational-scaling}.
+When all inputs are restricted to 1,024 tokens, \ours requires a small additional time overhead relative to the baseline for indexing and search. 
+However, the benefits of \ours are clear as input length increases:
+the GPU-time required increases \textit{sublinearly} with input length.
+Additional GPU-time measurements are reported in 
+in Appendix 
+\ref{appendix:subsect:computational-cost}.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\section{Related Work}
+
+\textbf{Long-range transformers} 
+Previous long-range transformers
+change the transformer architecture to reduce its space or time requirements \citep{efficiency-survey}. 
+Most solutions achieve this reduction through sparsifying the attention mechanism \citep{sparse-transformers,reformer,beltagy2020longformer,routing-transformers,ETC,big-bird}. Other works approximate or replace the attention mechanism entirely \citep{linformer,linear-transformers,performers,fnet}. 
+All these approaches change the standard transformer architecture or its training objective \citep{zhong2022training}, and thus require pretraining the model from scratch, which does not allow to leverage existing pretrained models. In contrast, \ours is \emph{generic}, can be injected into any encoder-decoder transformer, and improve it either without training or with merely fine-tuning. This way, \ours can leverage any already-pretrained model. 
+
+
+
+
+
+
+\textbf{Comparison to \citet{memtrans}} The closest work to ours is Memorizing Transformers \citep{memtrans}. Memorizing Transformers construct two datastores for each attention head in each layer, and due to memory constraints can thus apply their approach only to a single decoder layer. In contrast, thanks to our attention reformulation (\Cref{subsec:attentiontrick}) \ours can use a \emph{single} index for all decoder layers, and thus allow \emph{all} cross-attention  heads in all decoder layers retrieve from the long context. 
+As we show in \Cref{sec:results}, this results in significant empirical gains over retrieving only at a single layer.
+Further, Memorizing Transformers introduce additional learned weights, thus they \emph{must} be trained to incorporate their memory, and thus cannot easily leverage pretrained models; as we show in \Cref{sec:results} \ours can improve existing models without any training, and thus can be applied to any existing transformer.
+
+\textbf{Comparison to \citet{sled}} Another related work to ours is SLED \citep{sled}. SLED encodes long inputs in chunks, similarly to \ours, but the decoder in SLED attends to \emph{all} inputs at the same time. This in practice limits SLED to only about 16k token-long inputs on a single GPU; in contrast, instead of attending to \emph{all} input tokens, \ours attends only to the top-$k$ input tokens for every attention head, and thus can process unlimited inputs in practice, while preserving more than 99\% of the attention mass.
+Further, SLED requires computationally costly training, while \ours can provide benefits without any training.
+
+Additional related work is discussed in \Cref{app:related}.
+
+
+\section{Conclusions}
+We present \ours{}, an approach for augmenting pretrained encoder-decoders and offloading the cross-attention computation to a $k$NN index, to allow for unlimited length input.
+Instead of attending to all keys, this $k$NN index allows every cross-attention head in every decoder layer to retrieve and attend only to its top-$k$ keys.
+We evaluate \ours on several long-document and book-summarization benchmarks having inputs of up to 500K tokens, and show that \ours improves existing models, even without further training. When \emph{training} with \ours, not only that \ours makes smaller models such as BART perform better than larger Longformer-based models, \ours can be applied on top of Longformer-based models and further improve them.
+
+
+We hope that our approach will allow the democratization of long-range transformers, especially for researchers and practitioners with low-compute resources.
+Toward this end, we release our code at \url{https://github.com/abertsch72/unlimiformer}. 
+Our code is based on HuggingFace Transformers \citep{wolf-etal-2020-transformers}, without changing any individual architecture's code, and thus can be injected into any encoder-decoder based model.
+
+\section*{Acknowledgments}
+We are grateful to Sireesh Gururaja for the useful feedback on the draft of this paper.
+We also thank Maor Ivgi for the help in reproducing results from SLED \citep{sled} and for sharing code and models, and Uri Shaham for the discussions about the SCROLLS benchmark \citep{scrolls}.
+
+\section*{Limitations}
+In our experiments, we have only considered English-language datasets. While we have no reason to believe the method would suffer from the use of a different high-resourced language,  the quality of the nearest-neighbors search depends on the quality of the indexed keys. %
+
+
+\ours can process the longest inputs when the index is offloaded to the CPU memory. In this case, \ours requires to index only a single vector per input token, which practically means unlimited inputs for any modern server and even small machines.
+However, offloading the index to the CPU results in higher test-time latency compared to storing the encoded hidden states and the index on the GPU.
+In our experiments, we were able to use a GPU index for input examples exceeding 500k tokens (on GPUs no larger than 48 GBs), but this may be a concern when using smaller GPUs or larger models.
+
+
+
+
+
+\appendix
+\section{Training details}
+\label{appendix:implementation-details}
+At training time, we must backpropagate through the operations described above. Thus, the input length is bounded more strictly -- the number of tokens in the full input must fit in GPU memory while the model is loaded. For the computationally expensive methods, we train using batch size 1 and truncate the longest inputs (generally, to 16k tokens). At test time, 
+we use the full input without truncation. We train one model per setting, using the hyperparameter settings from SLED \citep{sled} and early stopping.
+
+\section{WikiSum scraping}
+\label{subsec:wikisum-scrape}
+We rescraped the dataset, following the same preprocessing steps as the original authors. We observe that many inputs in the scraped dataset are shorter than reported, likely due to changes in availability of the data since 2017; as a preprocessing step, we remove all inputs that are less than 1457 words, which is the 40th percentile of citation size for the original dataset. 
+We trained on 10,000 randomly selected examples from this version of WikiSum and evaluate on 2,000 randomly sampled examples (1,000 validation, 1,000 test), maintaining the same sample across all experiments. When sampling, we respect the original WikiSum train/validation/test split.
+We release the subset we trained on as well as our modified version of the scraping code. 
+
+\section{Evaluation details}
+\label{appendix:evaldetails}
+Vanilla BERTScore is only well-defined up to 512 tokens; for GovReport and ScriptSumm, we evaluate using \texttt{facebook/bart-large-mnli} instead. This model has context size 1024. For BookSum, we experimented with using \texttt{allenai/longformer-large-4096} (context size 4096), as many references are longer than 1024 tokens; however, we found that this approach had no distinguishing power between model outputs, ranking all models tested within 0.3 points of each other despite observing significant differences with ROUGE, EntMent, and manual inspection. \\
+
+For computing Entity Mention Recall (EntMent), we used SpaCy\footnote{\url{https://spacy.io}} to tag all named entities in the gold summary and collected a set of unique entities.
+We then tagged each candidate summary and computed the percentage of entities present in this summary, that is, recall of unique entities.
+For the named entity recognition in EntMent, we used SpaCy's \texttt{en\_core\_web\_lg} model.
+
+\section{Computational Cost}
+\label{appendix:subsect:computational-cost}
+We estimate the total GPU time for results presented in this paper did not exceed approximately 116 days of time on a single 48-GB A6000. The longest-training models, SLED and retrieval training for GovReport, took approximately 10 days to train. \\
+
+Table \ref{tab:computational-effort} shows the relative cost for each method. The \ours training methodologies are higher cost than the base training; however, the largest difference occurs during inference, where the full input (in Booksum, an average of 112,885 tokens) must be encoded, instead of the 1,024 tokens encoded in the baseline approach.
+
+
+\begin{table}[h!]
+\centering
+\begin{tabular}{l|lll}
+\toprule
+Method                      & Relative GPU-time \\ 
+\midrule
+Baseline training                  &  1.00  $\pm$ 0.00                            \\
+Chunked training            &        1.02   $\pm$ 0.02                       \\
++early stop w/ \ours &        1.00   $\pm$ 0.00                      \\
+Retrieval training                &        1.89    $\pm$ 0.06                      \\
+Random-encoded training           &        2.87    $\pm$ 0.28               \\ 
+\midrule
+Baseline inference & 1.00 $\pm$ 0.00 \\
+\ours inference & 4.48 $\pm$ 0.56 \\
+\bottomrule
+\end{tabular} 
+\caption{Computational effort per epoch for different training methodologies, relative to the baseline of standard finetuning and inference. All are averaged over 3 runs on BookSum using a single 48 GB A6000 GPU, 32 GB RAM, and 16 CPUs.}
+\label{tab:computational-effort}
+\end{table}
+
+
+Using a CPU datastore is many times slower than a GPU datastore because of slower search and the need to transfer retrieved embeddings to the GPU. 
+In our experiments, we were able to use a GPU datastore for input examples exceeding 500k tokens (on GPUs no larger than 48 GBs), but this may be a concern when using smaller GPUs or even larger inputs.
+Additionally, CPU indices are necessary for models with context windows larger than 2048 tokens, as the Faiss GPU index implementation does not support retrieving more than 2048 nearest neighbors; however, the datastore can still be stored on GPU.
+
+\section{Validation Results}
+\label{appendix:validation}
+\Cref{tab:small-datasets-val} shows the \emph{validation} metrics for GovReport and SummScreen.
+
+\begin{table*}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+Base model & Training method             & \multicolumn{2}{c}{ROUGE 1 / 2 / L / BERTScore} \\ %
+& &\multicolumn{1}{c}{GovReport} & \multicolumn{1}{c}{SummScreen} \\
+\midrule
+\multicolumn{4}{l}{\qquad\quad\underline{Low-cost training methods}:} \\
+\textsc{bart}$_{\texttt{base}}$       & Standard finetuning          & 47.7 / 18.5 / 22.3 / 64.0 & 30.0 / 6.5 / 17.7 / 56.7  \\
+\textsc{bart}$_{\texttt{base}}$       & \qquad+test SLED                 &  46.0 / 16.3 / 20.3 / 62.8 &  28.4 / 5.9 / 17.0 / 56.0 \\
+\textsc{bart}$_{\texttt{base}}$       & \qquad+test \ours                 &      49.5 / 19.6 / 21.9 / 64.8    &  31.8 / 7.1 / 18.6 / 57.8  \\
+\textsc{bart}$_{\texttt{base}}$       & \qquad+early stop w/  \ours &      51.0 / 20.6 / 21.6 / 65.9 &\textbf{32.5} / \textbf{7.2} / \textbf{19.9} / \textbf{57.9} \\
+\textsc{bart}$_{\texttt{base}}$    & Train chunked     &   48.3 / 18.1 / 22.3 / 63.8 &  29.4 / 6.3 / 17.6 / 56.8  \\
+\textsc{bart}$_{\texttt{base}}$       & \qquad+test \ours      & \textbf{52.9} / \textbf{22.2} / \textbf{22.4} / 65.8 & 29.4 / 6.3 / 17.6 / 56.8 \\
+\multicolumn{4}{l}{\qquad\quad\underline{Long-range training methods}:} \\
+\textsc{bart}$_{\texttt{base}}$       & SLED  \citep{sled} & 55.5 / 24.8 / 25.8 / 66.9 & 34.2 / 8.2 / 19.2 / \textbf{58.8} \\
+\textsc{bart}$_{\texttt{base}}$       & Memorizing Transformers  & 55.8 / 25.6 / 26.9 / 67.7 & 32.8 / 7.6 / 19.3 / 57.7  \\
+\textsc{bart}$_{\texttt{base}}$       & \ours &  \textbf{57.4} / \textbf{26.4} / \textbf{27.9} / \textbf{68.2}   &  \textbf{35.0} / \textbf{8.3} / \textbf{19.6} / 58.4 \\ 
+\midrule
+\multicolumn{4}{l}{\qquad\quad\underline{Low-cost training methods}:} \\
+\textsc{PRIMERA}    & Standard finetuning    &  55.0 / 23.6 / 25.9 / 66.9  & 33.0 / 7.8 / 18.8 / 57.4 \\
+\textsc{PRIMERA}       & \qquad+test \ours                 &  \textbf{56.4} / 24.7 / \textbf{26.4} / \textbf{67.6}  &     33.1 / 7.9 / 18.7 / 57.4 \\
+\textsc{PRIMERA}       & \qquad+early stop w/  \ours & \textbf{56.4} / \textbf{25.0} / \textbf{26.4} / \textbf{67.6} &     \textbf{33.5} / \textbf{8.2} / \textbf{19.3} / \textbf{57.7} \\
+\multicolumn{4}{l}{\qquad\quad\underline{Long-range training methods}:} \\
+\textsc{PRIMERA}    & Memorizing transformers    & 57.0 / 25.6 / 26.8 / 67.8 & 32.9 / 7.7 / 18.5 / 57.5 \\
+\textsc{PRIMERA}    & \ours &  \textbf{58.0} / \textbf{26.5} / \textbf{28.6} / \textbf{68.3} & \textbf{34.1} / \textbf{7.9} / \textbf{19.0} / \textbf{57.8} \\
+\bottomrule
+\end{tabular} 
+
+\caption{Validation results on long-document datasets (average input length between 4k to 16k tokens).  
+The best metric in every dataset and every training category is marked in \textbf{bold}.
+} 
+\label{tab:small-datasets-val}
+\end{table*}
+
+\label{appendix:booksum-lengths}
+\section{Sample Outputs}
+\label{sec:sample_output}
+These outputs from BookSum are summaries of \textit{The Brothers Karamazov}, an elaborate novel about a Russian family. Neither summary is fully factually correct, but the summary from the input-truncated model hallucinates several plotlines (e.g. a lover from the Congo, the many deaths of Pavel) which are not present in the original. The hallucinations in the \ours output are more constrained; for instance, it incorrectly describes Dmitri as a ``nobleman'' instead of a landowner and says he has been sentenced to death instead of jail. This summary features more of the novel's characters and identifies plot details from the later parts of the book, such as Dmitri's trial.
+
+\textbf{Gold (reference) summary:}
+\begin{quote}
+The Brothers Karamazov is a family tragedy centered around a father and his sons. Fyodor, the eldest Karamazov, has three sons: Dmitri, Ivan, and Alyosha. Ivan and Alyosha have the same mother, but Dmitri, the oldest, has a different mother. Fyodor is a greedy landowner, a bawdy lecher, and a neglectful father. Hence, the Karamazov brothers end up growing into young men under the care of various other people. But they all have returned home to visit their father, and it is the first time they all have been together for quite some time. Dmitri has a dispute with Fyodor over his inheritance, and Alyosha, who is living in a monastery, suggests that they see Father Zossima, Alyosha's mentor. Alyosha believes that the wise old man can settle the dispute peacefully. Father Zossima is patient and kind, but Fyodor and Dmitri end up quarreling anyway. After Fyodor drives the men to frustration, they leave the monastery separately, and Alyosha worries about their family's future. Alyosha talks to Dmitri, who confesses his complicated situation with women and money. Dmitri promised to marry a girl named Katerina, and she lent him 3,000 rubles. Instead of paying it back, he spent it on another girl named Grushenka. He wants to run away with Grushenka, but he feels that he needs to pay Katerina back before he can do so. This is why he is so interested in getting the money from Fyodor. Back at Fyodor's house, Smerdyakov is talking to the Karamazovs. Smerdyakov is an epileptic servant who was adopted by Grigory and Marfa, Fyodor's other servants. He was born to a woman named Lizaveta who died in childbirth. She was the town idiot, and she lived off charity from the other townspeople. Everyone called her "Stinking Lizaveta," and when the town found out she was pregnant, they were furious at whoever could do such a thing to a helpless girl. They decided Fyodor must have been the culprit. Grigory and Marfa gave birth to a deformed child, and when they buried the child, they found Lizaveta, who had just given birth to Smerdyakov. They adopted the child immediately, and Fyodor named him. Father Zossima is dying, and Alyosha is distraught. Instead of asking Alyosha to stay with him during his last days, however, Father Zossima tells Alyosha he should leave the monastery to be with his family. His life gets even more complicated when a young crippled girl named Lise expresses that she has feelings for him. Alyosha visits Katerina, the girl who is engaged to marry Dmitri. Ivan is in love with her, but he feels that Dmitri is a better match for her. Frustrated and disgusted with his family's situation, Ivan says he is going to leave town. Alyosha sees a boy being picked on by his schoolmates, and he tries to talk to the boy, but he bites Alyosha's hand and runs away. Later, when Alyosha is bringing money to a man named Captain Snegiryov, who has been beaten by Dmitri, he recognizes the man's son. It is Ilusha, the boy who bit his hand. The family is poor, but Captain Snegiryov refuses to take the money because he feels that he needs to earn his son's respect after being humiliated by Dmitri--and accepting charity, especially from a Karamazov, is out of the question. When Alyosha goes back to see Katerina, he finds Lise, Madame Hohlakov's daughter. The two realize that they love each other, and they decide to get married. Alyosha goes to visit Ivan, and he finds him in a restaurant. Ivan has gone there to get away from his father, and Alyosha sits down with him to have an intimate talk. Ivan tells his brother about his thoughts regarding God and the world. He recites to Alyosha a poem he has written called "The Great Inquisitor." The poem describes Christ returning to earth in the sixteenth century. The Church throws him in jail, and The Great Inquisitor explains to him that his presence is problematic for the world. The Church has spent years trying to replace the sense of freedom Christ gave man with security. He talks about how cruel the world is, especially to innocent children. After their meal, Alyosha and Ivan part ways, feeling closer than ever. Ivan sees Smerdyakov when he goes back to his father's house, and Smerdyakov tells him he is worried about Fyodor. He is worried Dmitri will come to kill him and the old man will be helpless to save himself. Ivan goes to sleep very troubled. Father Zossima is on his deathbed, and Alyosha goes to visit him. The Elder tells those around him how much Alyosha reminds him of his older brother, a boy who died when he was a youth. He talks about being a profligate youth in the army. One day, he challenged another man to a duel because of a girl. Before the duel, however, he had a change of heart. He did not shoot and, after the duel, he retired from the army and joined a monastery. He talks about how much the Bible has affected him and says that everyone should embrace the world and the people in it. He dies. Many predicted that a miracle would happen upon Father Zossima's death, but his body begins to putrefy, filling the monastery with an awful smell. This fills the other monks with doubt that Father Zossima was the saintly man they thought he was. Alyosha is shaken by the news. He goes to see Grushenka, who has sent for him, and she admits to wanting to "ruin" him. When he tells her that Father Zossima has died, however, she becomes contrite about her callousness. She says she thinks she is a wicked person, and the two comfort each other. When Alyosha leaves, he has a renewed faith in Father Zossima and his teachings because Alyosha feels how wonderful it is to love and be loved in return. Meanwhile, Dmitri has become desperate. He wants to be with Grushenka, but he wants to pay Katerina back first. He goes on an odyssey, hoping that he can depend on the charity of others. He visits a man named Samsanov, a man who used to pursue Grushenka, and he hates Dmitri. He sends Karamazov to see a surly drunk, tricking Dmitri into thinking this man may be helpful. The man is practically incoherent, however, and Dmitri goes to find Madame Hohlakov. She tells Dmitri that the only way he will find 3,000 rubles is in the gold mines. In confusion, Dmitri concludes that Grushenka has gone to visit his father, and he goes to his father's house in a rage, carrying a brass pestle. When he arrives, he does not find Grushenka, but as he is leaving, Grigory, his father's servant, thinks he has come to murder Fyodor. The two scuffle, and Dmitri hits Grigory on the head with the pestle. After determining that the man is not dead, Dmitri flees the scene and looks for Grushenka. She is with Kalganov, a former lover who had treated her poorly. Dmitri decides that he will not end up with Grushenka and decides to kill himself after seeing her one more time. He crashes her party and sits down with her gentleman friend and some other men. The situation becomes tense, and after the gentlemen make some disparaging remarks about Russians and Dmitri, Grushenka decides she does not want to be with such an insulting and vicious man. She decides that she loves Dmitri, and as the two are coming to terms with their love, the police come to arrest him for the murder of Fyodor. As the police question Dmitri, it becomes clear that the facts all support the conclusion that he did indeed murder his father, even though he did not commit the crime. He was at the scene of the crime, wielding a weapon, the night of the murder. He had said he would kill his father on several occasions. He publicly announced he was looking for 3,000 rubles and was desperate to find them, and Fyodor reportedly had an envelope with 3,000 rubles that was stolen the night of the murder. Dmitri is carried away, and very few people believe that he is innocent of Fyodor's murder. Meanwhile, Alyosha is visiting Ilusha, the boy who bit his hand, in the hospital. The boy has fallen quite ill, and Alyosha has gotten to know many of the boy's friends, who are also visiting him. One boy, Kolya Krassotkin, is a leader among the boys. He and Ilusha were friends, but they had a falling out because Ilusha fed a pin to a dog, and Kolya did not approve of his cruelty. When Alyosha comes to visit, he and Kolya talk for quite some time. The boy looks up to this wise man about which he has heard so much from the other boys, and he wants to impress him. The two become friends, and Alyosha treats all the boys as equals. When Kolya goes in to see Ilusha, he gives him a dog as a present. He reveals that the dog is none other but the dog Ilusha gave the piece of bread with a pin in it. Kolya has nursed the dog back to health and has fully trained him as a gesture of friendship to Ilusha. The mood is dampened, however, when the doctors go in to see Ilusha. Without even saying it, everyone understands that the boy does not have much time left. Ilusha is brave, and he tries to lift the spirits of those around him. Later, Alyosha visits his brother in jail. Dmitri tells Alyosha that Ivan has concocted a plan for his escape from jail. Alyosha goes to talk to Ivan, who feels strangely guilty about his father's death. Alyosha tells his brother that he should not feel responsible for a crime that he did not commit, but Ivan stalks off angrily. He meets Smerdyakov, who tells Ivan he thinks the Karamazov brother is guilty as an accomplice to the murder. He says that Ivan wanted his father dead and left the night of the murder to try to free himself of the responsibility of protecting his father. Ivan is angry and troubled by this, and when he talks to Smerdyakov later, Smerdyakov flatly admits to hilling Fyodor. He says that Ivan's theories and ideas were the basis for his crime and that Ivan's talks with Smerdyakov basically rationalized the deed. When Ivan returns home after this meeting, he sees a devil in his room. The devil chastises him for being a wicked person with weaknesses and foibles that have led to disastrous circumstances. Alyosha bangs on the door and finds his brother in a feverish state, muttering about a devil and Smerdyakov. Alyosha stays the night with his brother to take care of him. Dmitri's trial begins. Many people from all around come to see the spectacle of the parricide trial. Dmitri has an excellent lawyer, but it is a hard case to win. The prosecution brings many witnesses who testify to seemingly damning evidence against Dmitri. The defense, however, discredits one after another of these witnesses, showing ulterior motives or mitigating circumstances. Alyosha defends his brother from the stand, and Katerina gives a moving account of Dmitri's honorable nature. Then Ivan comes into the courtroom, waving money and implicating Smerdyakov. Since he is yelling nonsense, disrupting the trial, and generally acting crazy, the court does not believe him. Suddenly, at the end of the trial, Katerina stands up again, showing a letter from Dmitri that clearly states Dmitri's intention to kill Fyodor as a last resort. She has a change of heart and no longer wants to lie to protect a man who has hurt her so much. Word comes to the courtoom that Smerdyakov has hanged himself. After final statements are made, the verdict comes back: guilty. Dmitri is sentenced to jail. Dmitri welcomes this chance to become a new man, but he does not want to be in exile in Siberia for the rest of his life; he wants to return to his home country before he dies. Ivan is still sick, and Katerina takes care of him. Alyosha visits the boys with whom he has become friends. They are sad because Ilusha has died. Alyosha passes along Father Zossima's teachings of love and understanding, and they all embrace his words, cheering him.
+
+\end{quote}
+
+\textbf{BART (with input truncated to 1024) summary:}
+\begin{quote}
+Fyodor Pavlovitch Karamazov, a landowner in his own day, lives with his three sons, Adelaida Ivanovna and Alexey. He is the son of the landowner, Fyodor, and his wife, Adele, are the daughters of a wealthy nobleman in the district. Adele is the daughter of a nobleman, and her father, Ivanovitch, is a prominent figure in the town. She is a beautiful, intelligent, and intelligent young woman, who is destined to be a great writer. She has a great deal of ambition, and she is determined to achieve her goals. However, her ambition is short-lived. She falls in love with a handsome young man named Ivanovn, who has recently returned from a trip to the Congo. He has a lot of money, but he is also a poor man, and he has no means of earning it. In fact, he is a miserly beggar, and so he spends most of his time trying to earn money from the poor. He also has a wife, a beautiful young girl, who he marries, and a young son, Ivan, who lives with him. He and Adele have two children, Ivan and Aleksey, and they are very happy, but they have a problem: Ivan is a poor beggar who is unable to pay his rent, and Aleksandra is a beggar. Ivan is very ill, so he is forced to sell his estate to a rich man named Vladimir. Vladimir is a rich, well-to-do man who is also rich, but who is not well-liked by the people who live in the neighborhood. Vladimir's wife, Evgeny, is also ill, and Vladimir's son, Pavel, is very sick. Vladimir has a bad case of typhus fever, which causes him to lose his job and his money. Vladimir, Pavel's younger brother, is sick, and Pavel is sent to the hospital to recover his father's condition. Pavel is also sick and dies, and Ivan is left to care for him. The next day, Pavel and Adelayna are reunited with their father, who died in a typhus epidemic in the country. Pavel's father, Vladimir, has died, and the family is now in mourning. Pavel has been unable to find a new wife, so the family decides to send him to Moscow, where he will be reunited with his father. The family is devastated, but Pavel is able to find an old friend, a young man who has just returned from the Congo, who will be able to help him. Pavel and Ivan are devastated by the loss of his father, but Ivan and Vladimir are able to make amends with Vladimir. Pavel, however, is devastated by this news, and, after a long period of mourning, he decides to return to Moscow. He returns to Moscow to find his father dead, and to find that his father has died. He then goes to Moscow and is buried in the city cemetery, where his father is buried. Pavel dies of a heart attack, and then he is buried with his mother. He was a young, beautiful, and beautiful woman who was raised by a kindly, kind, and generous family. He had a great time with his family, but his life was cut short when his father died. Pavel was left to live with his aunt and uncle in Moscow, and when he died, he was left alone with his uncle and his two sons. He died in Moscow and his mother, who had been living with him in a convent, died in the same convent. Pavel had been a poor, poor, and ill-treated man, but now he was able to raise his son and raise his own son. Pavel survived, and now he lives in Moscow with his Aunt and Uncle. He lives with their aunt and Uncle, who are very poor and poor. They live in a small house in the countryside, and their children are raised by their uncle and aunt. They have a great love for each other, but their love for one another is not reciprocated. Pavel also dies in the convent, and after a brief illness, Pavel is left with a broken heart. He dies in Moscow. His father, a wealthy man, is the father of his son, who was also a clergyman. Pavel died of a stroke in the hospital, and was buried in a nearby cemetery. He left Pavel and his family behind. Pavel tried to help Pavel, but was unable to save him, so Pavel was forced to leave Moscow. Pavel returned to Moscow in the middle of the night. He tried to save Pavel's life, but it was too late for Pavel. Pavel managed to escape, and in the end, Pavel was killed by a bullet. Pavel took Pavel's body and died of his own wounds. Pavel left Pavel to die in the forest. Pavel stayed with the family for a few years, until he died of an illness. Pavel became ill and Pavel was sent to
+
+\end{quote}
+
+\textbf{\ours summary:}
+\begin{quote}
+    The first part of the novel focuses on the question of whether or not the Russian nobleman, Dmitri Fyodorovitch, has killed his father. In the town of Ivanovna, the lieutenant-colonel of the Mushenkhanovitch is accused of the murder of his brother Ivanovitch. The lieutenant-in-command, Vasilyevitch, takes the form of a dog, and the two men--the two men and the woman who are questioned by the court-martial--murphy. The two men cry out to the God of Russia for help in their quest to save the town. The man, afraid of the wrath of the God, hands the dog a bunch of letters that are supposed to be proof of his love for his brother. The old man--the one who had killed his mother, and then found the letter--arrives. He reads it--asked the old man to forgive him for the murder and then takes the dog away. The other men, all of whom are prisoners, demand that the man confess his crime to the court. The first and most important thing they tell the court is that they love the man. The court acquits the man and sentences the man to death. The second man--an old officer of the town, Alekandrovitch--askes to tell them the same thing. The third man--in the process of confessing his crime--is Vashenka, a drunk man who has been sent to the town to kill his father, for reasons which are not entirely clear to the people. The woman's servant, Evgenyevna, is also the one who has told the court the story of the Medvedevitch's murder, for the good old man's and the young man's love. The three men, who are separated for the first time, are laughing at the man's attempt to seduce Mitya. The young man, in the meantime, is conscripted into the town-side. He tells the court that he loves her, but he has yet to tell her the true story. The men, in this room, demand a man to kill her, and she will not betray them. The women, in their own country, are rebelling against the man who had sent them three thousand roubles, and they will not allow the man of the people to see them. They will not let the man in the town be allowed to see the man--or Dmitriovitch; he will have her husband killed him. He will not tell the people who love him. The next man, named Vashenovitch, arrives, and takes the man away. They all begin to laugh at the fact that he has succeeded in seducing and entrusting his brother Dmitri. He is then taken away to the old woman's house, where the governor-side-of-the-world, and his sister, Arkadin, is being punished. The priestesses and the baron are shocked, for they have been so virtuous and well-suited. The only thing they will be able to do is kill the priest. They threaten to burn the priestess to death, for she has been so wicked and libidinous that she has not yet seen the priest, for her husband. The priests--ostensibly convinced that she is a woman who loves the priest and has been punished for her love and for allowing the priest to marry her. The last man, Yakivitch, arrives at the house, and, after a long day of drinking and then some of the men--is killed. He and the priest are ordered to leave the town so that the priest can finally be reunited with the people of the old lady. The final man, the commander of the St. Petersburg town of Arkadina, is sentenced to death for the crime of having killed and then the lieutenant of the governor, for taking the money. The commander, the former lieutenant-delegation of the People's Army, is summarily executed, and all the men, except for the commander, have been summarily punished for their crime. The entire town is shocked and, in a very dramatic way, the priestesses plead for the forgiveness of the man, for allowing them to kill and imprison Ivan. They plead for their brother to be restored as well, for all the people they have loved, and for the priestor to tell the story.
+
+\end{quote}
+
+\section{Additional Related Work}
+\label{app:related}
+\textbf{Long-document summarization} Prior work has proposed several strategies for long-document summarization. In particular, many methods select a subsection of input to summarize using TF-IDF \citep{wikisum}, smaller retriever models \citep{liu-lapata-2019-hierarchical}, or sentence similarity metrics \citep{bajaj-etal-2021-long}. 
+An orthogonal approach is to summarize chunks of the input, then combine and condense these sub-summaries into a global summary, either using vanilla transformer models (\citet{booksum}, \citet{zhang-etal-2022-summn}, \citep{zhang-etal-2021-leveraging-pretrained}) or a specialized architecture (\citet{liu-lapata-2019-hierarchical}, \citet{grail-etal-2021-globalizing}).
+Other work has focused on expanding the amount of text that can be processed, by applying long-context transformers or developing new long-context methods \citep{huang-etal-2021-efficient}.
+However, these methods all suffer from cascading errors: if the initial trimming or chunk summarization steps remove important information, there is no way to recover that information in the downstream summary. 
+
+\textbf{Retrieval-augmented transformers} Interpolating language model probabilities with nearest neighbors retrieval from an external datastore was originally proposed by \citet{knnlm}. %
+Additional work in this space has improved the selection of neighbors \citep{drozdov-etal-2022-cant} or added structure to the datastore \citep{retomaton}. Despite the shared use of retrieval, all these works retrieve from an \emph{external} datastore, while \ours retrieves from a single input example, independently from external cumbersome sources.
+\citet{borgeaud2022improving} incorporate retrieval from the external datastore into the architecture, which requires pertaining the model from scratch; in contrast, \ours leverages any already-pretrained model, and thus can be applied to future models as well.
+
+\bibliography{anthology,custom}
+\bibliographystyle{acl_natbib}
+
+
+\end{document}

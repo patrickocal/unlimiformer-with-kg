@@ -1,0 +1,17 @@
+Transformer-based models typically have a predefined bound to their input length, because of their need to potentially attend to every token in the input. 
+In this work, we propose Unlimformer: a general approach that can wrap any existing pretrained model, and offload the attention computation to a $k$-nearest-neighbor index; this index can be kept on either the GPU or CPU memory and queried in sub-linear time. 
+This way, we can index extremely long input sequences, while every attention head in every decoder layer retrieves its top keys, instead of attending to every key.
+We demonstrate Unlimformer on several long-document and multi-document summarization benchmarks, showing that it can summarize even 500k token-long inputs from the WikiSum dataset, without any input truncation at test time.
+Unlimformer improves pretrained models such as BART \cite{lewis2020bart} and Longformer \cite{beltagy2020longformer} by extending them to unlimited inputs without additional learned weights and without modifying their code. 
+We make our code and models publicly available.
+
+
+Amanda's original abstract:
+We propose a new method, named Unlimformer, for retrieval-augmented seq2seq modeling that can be used to extend pretrained models trained on short sequences to effectively use unlimited length sequences. 
+At each decoding step, each attention head in each layer chooses a separate set of tokens from the full input to treat as the effective context for the decoding.
+This removes the need for a heuristic pre-extraction step or hierarchical processing approach for long inputs. 
+We demonstrate the usefulness of this approach in long-document and multi-document summarization.
+We present results across both ``standard'' and long-context transformers, demonstrating performance improvements in several finetuning regimes that require only the same order of magnitude of compute as vanilla transformers.
+Unlimformer is able to process 500k token inputs from WikiSum without any input truncation at inference time. 
+In higher-cost training regimes, our method achieves a new state of the art for its size on GovReport, ScriptSumm, and BookSum.
+We release our code and trained models. 
